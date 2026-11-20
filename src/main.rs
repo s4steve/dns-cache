@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let path = std::env::args().nth(1).unwrap_or_else(|| "/etc/dns-cache/config.toml".into());
     let cfg = Config::load(&path)?;
-    let views: Views = Arc::new(RwLock::new(Arc::new(cfg.build_views().await?)));
+    let views: Views = Arc::new(RwLock::new(Arc::new(cfg.build_views(&[]).await?)));
 
     let mut server = Server::new(Handler { views: views.clone() });
     for addr in &cfg.listen {
@@ -146,7 +146,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!(%addr, "listening on udp+tcp");
     }
 
-    // SIGHUP: rebuild all views from config; keep the old ones if the new config is bad.
+    // SIGHUP: rebuild views from config, keeping caches of views whose resolver settings are unchanged.
+    // If the new config is bad, keep serving the old one.
     let mut hup = signal(SignalKind::hangup())?;
     tokio::spawn(async move {
         while hup.recv().await.is_some() {
@@ -156,7 +157,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if new.listen != cfg.listen {
                     warn!("listen addresses changed; restart to apply");
                 }
-                new.build_views().await
+                let old = views.read().unwrap().clone();
+                new.build_views(&old).await
             };
             match built.await {
                 Ok(v) => {

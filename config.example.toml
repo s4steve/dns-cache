@@ -1,5 +1,6 @@
 # dns-cache config. Copy to config.toml. Send SIGHUP to reload
-# (`docker kill -s HUP dns-cache`); changes to `listen` need a restart.
+# (`docker kill -s HUP dns-cache`). A view keeps its cache across reloads unless its
+# upstreams, dnssec or cache_size change; changes to `listen` need a restart.
 
 listen = ["0.0.0.0:53"]   # UDP + TCP on each address
 poll_secs = 30            # how often local blocklist files are checked for changes

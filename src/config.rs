@@ -40,7 +40,7 @@ pub struct ViewConfig {
     pub blocklists: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
     pub ip: IpAddr,
@@ -54,7 +54,7 @@ pub struct Upstream {
     pub path: Option<String>,
 }
 
-#[derive(Deserialize, Default, Clone, Copy)]
+#[derive(Deserialize, Default, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     #[default]
@@ -73,11 +73,15 @@ fn yes() -> bool {
     true
 }
 
+/// Everything that shapes a view's resolver; if unchanged on reload, the resolver (and its cache) is reused.
+type ResolverKey = (Vec<Upstream>, bool, Option<u64>);
+
 pub struct View {
     pub name: String,
     pub nets: Vec<IpNet>,
     pub resolver: TokioResolver,
     pub blocklist: blocklist::Shared,
+    key: ResolverKey,
 }
 
 impl Config {
@@ -100,20 +104,28 @@ impl Config {
     }
 
     /// Build every view, loading its blocklists before returning so nothing is served unfiltered.
-    pub async fn build_views(&self) -> Result<Vec<View>, Error> {
+    /// A view whose name and resolver settings match one in `old` keeps that resolver and its cache.
+    pub async fn build_views(&self, old: &[View]) -> Result<Vec<View>, Error> {
         let (poll, refresh) = (Duration::from_secs(self.poll_secs), Duration::from_secs(self.refresh_secs));
         let mut views = Vec::new();
         for v in &self.views {
+            let key: ResolverKey = (v.upstreams.clone(), v.dnssec, v.cache_size);
+            let reused = old.iter().find(|o| o.name == v.name && o.key == key);
+            let resolver = match reused {
+                Some(o) => o.resolver.clone(), // clones share the same cache
+                None => resolver(v)?,
+            };
             let mut lists = Lists::new(&v.blocklists);
             let set = lists.refresh(refresh).await.unwrap_or_default();
-            info!(view = v.name, entries = set.len(), "view ready");
+            info!(view = v.name, entries = set.len(), cache_kept = reused.is_some(), "view ready");
             let blocklist = Arc::new(RwLock::new(Arc::new(set)));
             lists.spawn(v.name.clone(), Arc::downgrade(&blocklist), poll, refresh);
             views.push(View {
                 name: v.name.clone(),
                 nets: v.match_clients.clone(),
-                resolver: resolver(v)?,
+                resolver,
                 blocklist,
+                key,
             });
         }
         Ok(views)

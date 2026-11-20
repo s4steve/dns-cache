@@ -1,0 +1,39 @@
+services:
+  dns-cache:
+    build: .
+    container_name: dns-cache
+    restart: unless-stopped
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    volumes:
+      - ./config.toml:/etc/dns-cache/config.toml:ro
+      - ./lists:/etc/dns-cache/lists:ro
+    environment:
+      RUST_LOG: info,hickory_server=warn   # hickory_server=info logs every query
+    networks:
+      dns:
+        ipv4_address: 172.30.0.2
+
+  # Throwaway clients with fixed IPs for testing views:
+  #   docker compose --profile test run --rm client-kids dig @172.30.0.2 reddit.com
+  client-kids:
+    image: alpine:3.20
+    profiles: [test]
+    entrypoint: ["sh", "-c", "apk add -q bind-tools >/dev/null && exec \"$$@\"", "--"]
+    networks:
+      dns:
+        ipv4_address: 172.30.0.20
+  client-default:
+    image: alpine:3.20
+    profiles: [test]
+    entrypoint: ["sh", "-c", "apk add -q bind-tools >/dev/null && exec \"$$@\"", "--"]
+    networks:
+      dns:
+        ipv4_address: 172.30.0.40
+
+networks:
+  dns:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

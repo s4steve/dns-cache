@@ -1,0 +1,35 @@
+# dns-cache config. Copy to config.toml. Send SIGHUP to reload
+# (`docker kill -s HUP dns-cache`); changes to `listen` need a restart.
+
+listen = ["0.0.0.0:53"]   # UDP + TCP on each address
+poll_secs = 30            # how often local blocklist files are checked for changes
+refresh_secs = 86400      # how often http(s) blocklists are re-downloaded
+
+# Views are matched by client source address; first match wins.
+# Each view has its own cache, upstreams and blocklists.
+# A blocked name, or any subdomain of it, gets NXDOMAIN without being resolved.
+
+[[view]]
+name = "kids"
+match_clients = ["172.30.0.16/28"]
+dnssec = true
+cache_size = 10000
+upstreams = [
+  { ip = "1.1.1.1", protocol = "tls", tls_name = "cloudflare-dns.com" },
+]
+blocklists = [
+  "/etc/dns-cache/lists/default.txt",
+  "/etc/dns-cache/lists/kids.txt",
+  # Remote lists may be plain domains or hosts format, e.g.:
+  # "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+]
+
+[[view]]
+name = "default"
+match_clients = ["0.0.0.0/0", "::/0"]
+dnssec = true
+upstreams = [
+  { ip = "9.9.9.9", protocol = "https", tls_name = "dns.quad9.net" },
+  { ip = "1.1.1.1" },   # plain udp/tcp; port defaults to 53/853/443 by protocol
+]
+blocklists = ["/etc/dns-cache/lists/default.txt"]

@@ -1,0 +1,2 @@
+# Extra names blocked only for the kids view.
+reddit.com

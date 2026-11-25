@@ -11,6 +11,20 @@ services:
       - ./lists:/etc/dns-cache/lists:ro
     environment:
       RUST_LOG: info,hickory_server=warn   # hickory_server=info logs every query
+    # Hardening: non-root (see Dockerfile), read-only filesystem, no capabilities.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0   # lets the non-root user bind port 53
+    # Resource caps, so a flood degrades the resolver instead of the host.
+    mem_limit: 512m
+    pids_limit: 256
+    ulimits:
+      nofile: { soft: 16384, hard: 16384 }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
     networks:
       dns:
         ipv4_address: 172.30.0.2

@@ -1,14 +1,20 @@
 # dns-cache config. Copy to config.toml. Send SIGHUP to reload
 # (`docker kill -s HUP dns-cache`). A view keeps its cache across reloads unless its
-# upstreams, dnssec or cache_size change; changes to `listen` need a restart.
+# upstreams, dnssec or cache_size change. Changes to `listen`, `rate_limit` and
+# `max_inflight` need a restart.
 
 listen = ["0.0.0.0:53"]   # UDP + TCP on each address
 poll_secs = 30            # how often local blocklist files are checked for changes
 refresh_secs = 86400      # how often http(s) blocklists are re-downloaded
+rate_limit = 200          # queries/second per client IP; excess is dropped (0 = off)
+max_inflight = 1024       # upstream lookups in progress at once; excess gets SERVFAIL
 
 # Views are matched by client source address; first match wins.
 # Each view has its own cache, upstreams and blocklists.
 # A blocked name, or any subdomain of it, gets NXDOMAIN without being resolved.
+# A client that matches no view gets REFUSED, so keep match_clients to networks you
+# serve: a view matching 0.0.0.0/0 on a public address is an open resolver that
+# attackers will use for DDoS amplification.
 
 [[view]]
 name = "kids"
@@ -27,7 +33,11 @@ blocklists = [
 
 [[view]]
 name = "default"
-match_clients = ["0.0.0.0/0", "::/0"]
+match_clients = [
+  "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",   # loopback + RFC 1918
+  "100.64.0.0/10",                                                # CGNAT / Tailscale
+  "::1/128", "fc00::/7", "fe80::/10",                             # IPv6 loopback, ULA, link-local
+]
 dnssec = true
 upstreams = [
   { ip = "9.9.9.9", protocol = "https", tls_name = "dns.quad9.net" },

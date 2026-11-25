@@ -7,6 +7,7 @@ A caching-only DNS server written in Rust. It forwards queries to upstream resol
 - **Upstreams**: plain UDP/TCP, DNS-over-TLS (DoT) or DNS-over-HTTPS (DoH).
 - **DNSSEC validation**: answers that fail validation get `SERVFAIL`.
 - **Hot reload**: on `SIGHUP` the server re-reads its config without dropping the cache.
+- **Abuse limits**: a per-client rate limit, a cap on concurrent upstream lookups, and a hardened container (see [Security](#security)).
 
 It is built on [hickory-dns](https://github.com/hickory-dns/hickory-dns).
 
@@ -46,10 +47,14 @@ The config is TOML. [`config.example.toml`](config.example.toml) is a working ex
 | `listen` | required | Addresses to serve on. UDP and TCP are both served on each one, e.g. `["0.0.0.0:53", "[::]:53"]`. Changing this needs a restart. |
 | `poll_secs` | `30` | How often local blocklist files are checked for changes. |
 | `refresh_secs` | `86400` | How often remote (`http://` / `https://`) blocklists are downloaded again. |
+| `rate_limit` | `200` | Queries per second allowed from one client IP. Queries over the limit are dropped without a reply. `0` turns it off. Needs a restart to change. |
+| `max_inflight` | `1024` | Upstream lookups in progress at once, across all views. Lookups over the limit get an immediate `SERVFAIL`; cached answers and blocked names are unaffected. Needs a restart to change. |
 
 ### `[[view]]`
 
-Views are tried in the order they appear in the file, and the first one whose `match_clients` contains the client's IP is used. A client that matches no view gets `REFUSED`. To give everyone else a default, put a catch-all view (`["0.0.0.0/0", "::/0"]`) last.
+Views are tried in the order they appear in the file, and the first one whose `match_clients` contains the client's IP is used. A client that matches no view gets `REFUSED`.
+
+> **Don't run an open resolver.** Only list the networks you actually serve. A view that matches `0.0.0.0/0` on a server reachable from the internet will be found and used for DDoS amplification. The example's `default` view covers loopback, RFC 1918, CGNAT and IPv6 private ranges.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -58,7 +63,7 @@ Views are tried in the order they appear in the file, and the first one whose `m
 | `upstreams` | required | One or more upstream resolvers (see below). |
 | `dnssec` | `true` | Validate DNSSEC. Bogus answers become `SERVFAIL`. |
 | `cache_size` | `8192` | Maximum number of cached responses for this view. |
-| `blocklists` | `[]` | Local file paths and/or `http(s)://` URLs. All of them are merged. |
+| `blocklists` | `[]` | Local file paths and/or `http(s)://` URLs. A name on any of them is blocked. |
 
 ### Upstreams
 
@@ -95,10 +100,13 @@ ads.example.com
 
 - A listed domain blocks the domain itself and all of its subdomains. `example.com` blocks `a.b.example.com`, but not `notexample.com`.
 - Comments start with `#`. Trailing dots and letter case are ignored.
+- Internationalised names can be written either way (`bücher.example` or `xn--bcher-kva.example`); both are matched against the punycode form queries arrive in.
 - In hosts-format lines, names without a dot (such as `localhost`) and IP addresses are skipped.
 - Local files are re-read when their modification time changes, checked every `poll_secs`. No restart is needed.
-- URLs are downloaded again every `refresh_secs`. If a download fails, the last good copy is kept.
-- Blocked queries are logged at `info` level with the view and client IP.
+- URLs are downloaded again every `refresh_secs`. If a download fails, the last good copy is kept and the download is retried after 5 minutes.
+- Files and downloads over 100 MiB are rejected (the last good copy is kept).
+- `http://` lists are accepted but logged as a warning, because anyone on the network path can add entries to them. Redirects from `https://` to `http://` are refused.
+- A source used by several views is downloaded and stored once, and shared between them.
 
 ## Reloading
 
@@ -109,19 +117,21 @@ docker kill -s HUP dns-cache
 A reload re-reads `config.toml` and rebuilds the views:
 
 - **The cache is kept** for each view whose `name`, `upstreams`, `dnssec` and `cache_size` are unchanged. A view where any of those changed starts with an empty cache.
-- Blocklists are loaded again, which includes downloading remote lists.
+- Blocklist files are re-read if they changed. Remote lists are only downloaded again if their copy is older than `refresh_secs`.
 - If the new config is invalid, the error is logged and the old config keeps serving.
-- A change to `listen` is logged as a warning and needs a restart.
+- Changes to `listen`, `rate_limit` or `max_inflight` are logged as a warning and need a restart.
 
 ## Logging
 
-Logging is controlled with `RUST_LOG`, set in `docker-compose.yml`. The default is `info,hickory_server=warn`, which logs startup, reloads, blocked names and SERVFAILs. To log every query, use `RUST_LOG=info,hickory_server=info`.
+Logging is controlled with `RUST_LOG`, set in `docker-compose.yml`. The default is `info,hickory_server=warn`, which logs startup, reloads, blocklist changes and SERVFAILs. To also log each blocked name, add `dns_cache=debug`; to log every query, add `hickory_server=info`.
+
+Docker keeps at most 3 log files of 10 MB each, so a flood of queries can't fill the disk.
 
 ## Views and Docker networking
 
 The view is chosen by the client's source IP, so the container has to see each client's real address.
 
-- **Docker Desktop (macOS/Windows):** NAT changes the source address. Queries from the host or LAN arrive from the VM gateway (e.g. `192.168.65.1`), so they all land in the same view.
+- **Docker Desktop (macOS/Windows):** NAT changes the source address. Queries from the host or LAN arrive from the VM gateway (e.g. `192.168.65.1`), so they all land in the same view and share one `rate_limit` budget. Because that gateway address is private, never forward port 53 from the internet to a Docker Desktop host: every outside client would look like a local one.
 - **Linux:** to see real client IPs, use `network_mode: host` instead of `ports:` in `docker-compose.yml`.
 
 The compose file includes two test clients on the internal `172.30.0.0/24` network. They match the example `kids` and `default` views:
@@ -143,11 +153,27 @@ Binding to port 53 needs root (or `CAP_NET_BIND_SERVICE`). For local testing, us
 ## Tests
 
 ```bash
-cargo test                   # blocklist parsing and matching
+cargo test                   # blocklist parsing and matching, rate limiter
 ./tests/dnssec-check.sh      # needs docker + dig
 ```
 
 `dnssec-check.sh` checks that dns-cache does its own DNSSEC validation. It starts an unbound container with validation turned off, so bogus answers reach dns-cache. It then checks that dns-cache returns `SERVFAIL` for them, while correctly signed zones still resolve.
+
+## Security
+
+The compose file runs the container with:
+
+- a non-root user (uid 65532, from the distroless `nonroot` image), with `ip_unprivileged_port_start=0` so it can still bind port 53
+- a read-only root filesystem, all Linux capabilities dropped, and `no-new-privileges`
+- `mem_limit: 512m`, `pids_limit: 256` and a 16384 open-file limit, so a flood degrades the resolver rather than the host
+
+In the server itself:
+
+- **Rate limit:** each client IP gets `rate_limit` queries per second; the rest are dropped without a reply, so the server is no use for reflection attacks. During a flood from many (possibly spoofed) addresses, the server tracks at most 100,000 clients per second, and new clients are dropped until the next second.
+- **Upstream concurrency:** at most `max_inflight` lookups wait on upstreams at once.
+- **Response size:** UDP replies never exceed the buffer size the client advertised (at most 1,232 bytes), and are truncated with the TC flag so the client retries over TCP.
+
+Known limits: the cache is bounded by number of entries, not bytes, so names with very large records can use more memory per entry (the container's memory cap is the backstop). Incoming TCP connections are limited only by the open-file limit, each held for at most 10 seconds when idle.
 
 ## Not supported (yet)
 

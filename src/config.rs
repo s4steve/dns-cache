@@ -23,6 +23,12 @@ pub struct Config {
     /// How often remote (http/https) blocklists are re-downloaded.
     #[serde(default = "default_refresh")]
     pub refresh_secs: u64,
+    /// Queries per second allowed from one client IP; more are dropped. 0 disables.
+    #[serde(default = "default_rate_limit")]
+    pub rate_limit: u32,
+    /// Upstream lookups in progress at once, across all views; more get SERVFAIL.
+    #[serde(default = "default_max_inflight")]
+    pub max_inflight: usize,
     #[serde(rename = "view")]
     pub views: Vec<ViewConfig>,
 }
@@ -68,6 +74,12 @@ fn default_poll() -> u64 {
 }
 fn default_refresh() -> u64 {
     86400
+}
+fn default_rate_limit() -> u32 {
+    200
+}
+fn default_max_inflight() -> usize {
+    1024
 }
 fn yes() -> bool {
     true
@@ -116,9 +128,9 @@ impl Config {
                 None => resolver(v)?,
             };
             let mut lists = Lists::new(&v.blocklists);
-            let set = lists.refresh(refresh).await.unwrap_or_default();
-            info!(view = v.name, entries = set.len(), cache_kept = reused.is_some(), "view ready");
-            let blocklist = Arc::new(RwLock::new(Arc::new(set)));
+            let sets = lists.refresh(refresh).await.unwrap_or_default();
+            info!(view = v.name, entries = blocklist::count(&sets), cache_kept = reused.is_some(), "view ready");
+            let blocklist = Arc::new(RwLock::new(sets));
             lists.spawn(v.name.clone(), Arc::downgrade(&blocklist), poll, refresh);
             views.push(View {
                 name: v.name.clone(),

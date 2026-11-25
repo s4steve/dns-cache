@@ -1,23 +1,30 @@
 mod blocklist;
 mod config;
 
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use hickory_server::Server;
 use hickory_server::net::runtime::Time;
 use hickory_server::net::{DnsError, NetError};
-use hickory_server::proto::op::{Edns, Metadata, MessageType, OpCode, ResponseCode};
+use hickory_server::proto::op::{Edns, Header, Metadata, MessageType, OpCode, ResponseCode};
 use hickory_server::proto::rr::{Name, Record};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use config::{Config, View};
 
 type Views = Arc<RwLock<Arc<Vec<View>>>>;
+
+/// Largest UDP response we send (DNS Flag Day 2020), and the smallest a client may ask for.
+const MAX_UDP: u16 = 1232;
+const MIN_UDP: u16 = 512;
 
 #[derive(Default)]
 struct Answer {
@@ -33,12 +40,47 @@ impl From<ResponseCode> for Answer {
     }
 }
 
+/// Per-client queries per second, in fixed one-second windows.
+// ponytail: one global mutex; shard by IP if it ever shows up in a profile.
+struct RateLimiter {
+    limit: u32,
+    window: Mutex<(Instant, HashMap<IpAddr, u32>)>,
+}
+
+impl RateLimiter {
+    /// Clients tracked per window. Past this (e.g. a spoofed-source flood), new clients are
+    /// refused for the rest of the second rather than letting the map grow.
+    const MAX_CLIENTS: usize = 100_000;
+
+    fn new(limit: u32) -> Self {
+        Self { limit, window: Mutex::new((Instant::now(), HashMap::new())) }
+    }
+
+    fn allow(&self, ip: IpAddr) -> bool {
+        if self.limit == 0 {
+            return true;
+        }
+        let mut w = self.window.lock().unwrap();
+        if w.0.elapsed() >= Duration::from_secs(1) {
+            *w = (Instant::now(), HashMap::new());
+        }
+        if w.1.len() >= Self::MAX_CLIENTS && !w.1.contains_key(&ip) {
+            return false;
+        }
+        let n = w.1.entry(ip).or_default();
+        *n = n.saturating_add(1);
+        *n <= self.limit
+    }
+}
+
 struct Handler {
     views: Views,
+    limiter: RateLimiter,
+    inflight: Semaphore,
 }
 
 impl Handler {
-    async fn answer(&self, req: &Request) -> Answer {
+    async fn answer(&self, req: &Request, src: IpAddr) -> Answer {
         if req.metadata.message_type != MessageType::Query || req.metadata.op_code != OpCode::Query {
             return ResponseCode::NotImp.into();
         }
@@ -46,21 +88,37 @@ impl Handler {
             return ResponseCode::FormErr.into();
         };
 
-        let src = req.src().ip().to_canonical();
         let views = self.views.read().unwrap().clone();
         let Some(view) = views.iter().find(|v| v.nets.iter().any(|n| n.contains(&src))) else {
             debug!(%src, "no view matches client");
             return ResponseCode::Refused.into();
         };
 
-        let qname = q.name().to_string();
-        let qname = qname.trim_end_matches('.');
+        // Punycode, lowercase: the form blocklist entries are normalised to.
+        let name = Name::from(q.name().clone());
+        let ascii = name.to_ascii();
+        let qname = ascii.trim_end_matches('.');
         if blocklist::is_blocked(&view.blocklist.read().unwrap(), qname) {
-            info!(view = view.name, %src, name = qname, "blocked");
+            debug!(view = view.name, %src, name = qname, "blocked");
             return ResponseCode::NXDomain.into();
         }
 
-        match view.resolver.lookup(Name::from(q.name().clone()), q.query_type()).await {
+        let Ok(_permit) = self.inflight.try_acquire() else {
+            debug!(view = view.name, name = qname, "too many lookups in progress");
+            return ResponseCode::ServFail.into();
+        };
+        let mut res = view.resolver.lookup(name.clone(), q.query_type()).await;
+        // ponytail: hickory 0.26.3 keeps pooled upstream TCP/TLS connections the server has
+        // already closed, and each failed lookup evicts only a few. After a burst of misses this
+        // meant ~10 SERVFAILs in a row; retrying drains them. Drop when hickory fixes it.
+        for _ in 0..16 {
+            if !matches!(res, Err(NetError::NoConnections)) {
+                break;
+            }
+            res = view.resolver.lookup(name.clone(), q.query_type()).await;
+        }
+
+        match res {
             Ok(l) => Answer {
                 code: ResponseCode::NoError,
                 answers: l.answers().to_vec(),
@@ -85,10 +143,23 @@ impl Handler {
     }
 }
 
+fn header_only(req: &Request, code: ResponseCode) -> ResponseInfo {
+    let mut metadata = Metadata::response_from_request(&req.metadata);
+    metadata.response_code = code;
+    Header { metadata, counts: Default::default() }.into()
+}
+
 #[async_trait::async_trait]
 impl RequestHandler for Handler {
     async fn handle_request<R: ResponseHandler, T: Time>(&self, req: &Request, mut rh: R) -> ResponseInfo {
-        let mut a = self.answer(req).await;
+        let src = req.src().ip().to_canonical();
+        if !self.limiter.allow(src) {
+            // Dropped, not answered: a reply would still feed a reflection attack.
+            debug!(%src, "rate limited");
+            return header_only(req, ResponseCode::Refused);
+        }
+
+        let mut a = self.answer(req, src).await;
 
         // RFC 4035 §3.2.1: only include DNSSEC records if the client set the DO bit.
         let dnssec_ok = req.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok);
@@ -101,9 +172,11 @@ impl RequestHandler for Handler {
         let mut meta = Metadata::response_from_request(&req.metadata);
         meta.recursion_available = true; // never authoritative: `authoritative` stays false
         meta.response_code = a.code;
-        let edns = req.edns.as_ref().map(|_| {
+        // hickory truncates UDP responses to the size we advertise here, so never exceed
+        // what the client said it can take.
+        let edns = req.edns.as_ref().map(|client| {
             let mut e = Edns::new();
-            e.set_max_payload(1232).set_dnssec_ok(dnssec_ok);
+            e.set_max_payload(client.max_payload().clamp(MIN_UDP, MAX_UDP)).set_dnssec_ok(dnssec_ok);
             e
         });
         let resp = MessageResponseBuilder::new(&req.queries, edns.as_ref()).build(
@@ -117,9 +190,7 @@ impl RequestHandler for Handler {
             Ok(info) => info,
             Err(e) => {
                 error!(error = %e, "failed to send response");
-                let mut h = Metadata::response_from_request(&req.metadata);
-                h.response_code = ResponseCode::ServFail;
-                hickory_server::proto::op::Header { metadata: h, counts: Default::default() }.into()
+                header_only(req, ResponseCode::ServFail)
             }
         }
     }
@@ -130,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                // per-query logs: RUST_LOG=info,hickory_server=info
+                // per-query logs: RUST_LOG=info,hickory_server=info; blocked names: dns_cache=debug
                 .unwrap_or_else(|_| "info,hickory_server=warn".into()),
         )
         .init();
@@ -139,7 +210,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = Config::load(&path)?;
     let views: Views = Arc::new(RwLock::new(Arc::new(cfg.build_views(&[]).await?)));
 
-    let mut server = Server::new(Handler { views: views.clone() });
+    let mut server = Server::new(Handler {
+        views: views.clone(),
+        limiter: RateLimiter::new(cfg.rate_limit),
+        inflight: Semaphore::new(cfg.max_inflight),
+    });
     for addr in &cfg.listen {
         server.register_socket(UdpSocket::bind(addr).await?);
         server.register_listener(TcpListener::bind(addr).await?, Duration::from_secs(10), 64);
@@ -154,8 +229,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             info!("SIGHUP: reloading {path}");
             let built = async {
                 let new = Config::load(&path)?;
-                if new.listen != cfg.listen {
-                    warn!("listen addresses changed; restart to apply");
+                if new.listen != cfg.listen || new.rate_limit != cfg.rate_limit || new.max_inflight != cfg.max_inflight {
+                    warn!("listen, rate_limit and max_inflight changes need a restart");
                 }
                 let old = views.read().unwrap().clone();
                 new.build_views(&old).await
@@ -177,4 +252,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         _ = tokio::signal::ctrl_c() => info!("SIGINT: shutting down"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limiter() {
+        let (a, b): (IpAddr, IpAddr) = ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap());
+        let rl = RateLimiter::new(3);
+        assert!((0..3).all(|_| rl.allow(a)));
+        assert!(!rl.allow(a), "4th query in the same second is dropped");
+        assert!(rl.allow(b), "other clients are unaffected");
+        rl.window.lock().unwrap().0 -= Duration::from_secs(1);
+        assert!(rl.allow(a), "new window resets the count");
+        assert!((0..10).all(|_| RateLimiter::new(0).allow(a)), "0 disables");
+    }
 }

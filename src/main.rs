@@ -1,5 +1,6 @@
-mod blocklist;
 mod config;
+mod lists;
+mod records;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -10,7 +11,7 @@ use hickory_server::Server;
 use hickory_server::net::runtime::Time;
 use hickory_server::net::{DnsError, NetError};
 use hickory_server::proto::op::{Edns, Header, Metadata, MessageType, OpCode, ResponseCode};
-use hickory_server::proto::rr::{Name, Record};
+use hickory_server::proto::rr::{Name, Record, RecordType};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
 use tokio::net::{TcpListener, UdpSocket};
@@ -19,6 +20,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use config::{Config, View};
+use records::Local;
 
 type Views = Arc<RwLock<Arc<Vec<View>>>>;
 
@@ -94,20 +96,53 @@ impl Handler {
             return ResponseCode::Refused.into();
         };
 
-        // Punycode, lowercase: the form blocklist entries are normalised to.
+        // Punycode, lowercase: the form list entries are normalised to.
         let name = Name::from(q.name().clone());
         let ascii = name.to_ascii();
         let qname = ascii.trim_end_matches('.');
-        if blocklist::is_blocked(&view.blocklist.read().unwrap(), qname) {
-            debug!(view = view.name, %src, name = qname, "blocked");
-            return ResponseCode::NXDomain.into();
+        let qtype = q.query_type();
+
+        // 1. Local records: your own names, answered before any filtering.
+        let local = records::lookup(&view.records.read().unwrap(), q.original().name(), qname, qtype);
+        match local {
+            Some(Local::Done(answers)) => return Answer { code: ResponseCode::NoError, answers, ..Default::default() },
+            Some(Local::Upstream(chain, target)) => {
+                let mut a = self.upstream(view, target, qtype, qname).await;
+                a.answers.splice(0..0, chain);
+                return a;
+            }
+            Some(Local::Loop) => {
+                warn!(view = view.name, name = qname, "CNAME loop in local records");
+                return ResponseCode::ServFail.into();
+            }
+            None => {}
         }
 
+        // 2. Allowlist exceptions, walled garden, blocklists.
+        if !lists::contains(&view.allowlist.read().unwrap(), qname) {
+            let reason = if view.allow_only {
+                Some("not on allowlist")
+            } else if lists::contains(&view.blocklist.read().unwrap(), qname) {
+                Some("blocklist")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                debug!(view = view.name, %src, name = qname, reason, "blocked");
+                return ResponseCode::NXDomain.into();
+            }
+        }
+
+        // 3. Cache / upstream.
+        self.upstream(view, name, qtype, qname).await
+    }
+
+    async fn upstream(&self, view: &View, name: Name, qtype: RecordType, qname: &str) -> Answer {
         let Ok(_permit) = self.inflight.try_acquire() else {
             debug!(view = view.name, name = qname, "too many lookups in progress");
             return ResponseCode::ServFail.into();
         };
-        let mut res = view.resolver.lookup(name.clone(), q.query_type()).await;
+        let mut res = view.resolver.lookup(name.clone(), qtype).await;
         // ponytail: hickory 0.26.3 keeps pooled upstream TCP/TLS connections the server has
         // already closed, and each failed lookup evicts only a few. After a burst of misses this
         // meant ~10 SERVFAILs in a row; retrying drains them. Drop when hickory fixes it.
@@ -115,7 +150,7 @@ impl Handler {
             if !matches!(res, Err(NetError::NoConnections)) {
                 break;
             }
-            res = view.resolver.lookup(name.clone(), q.query_type()).await;
+            res = view.resolver.lookup(name.clone(), qtype).await;
         }
 
         match res {
@@ -136,7 +171,7 @@ impl Handler {
                 ..Default::default()
             },
             Err(e) => {
-                warn!(view = view.name, name = qname, qtype = %q.query_type(), error = %e, "SERVFAIL");
+                warn!(view = view.name, name = %name, %qtype, error = %e, "SERVFAIL");
                 ResponseCode::ServFail.into()
             }
         }

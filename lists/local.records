@@ -1,0 +1,9 @@
+# Local records: answered by dns-cache itself, before any allow/block checks.
+#   <name>  A|AAAA|CNAME|TXT  <value>
+#   <ip>    <name> [<name>...]          (hosts-style shorthand for A/AAAA)
+# PTR (reverse) records are generated for every address; the first name listed wins.
+# A name listed here answers only from this file: a type you don't define gets an
+# empty NOERROR, it is not sent upstream.
+router.home    A      192.168.1.1
+nas.home       A      192.168.1.10
+files.home     CNAME  nas.home

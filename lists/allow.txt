@@ -1,0 +1,2 @@
+# Names (and their subdomains) that are never blocked, even if a blocklist lists them.
+# In a view with allow_only = true, only these names (plus local records) resolve.

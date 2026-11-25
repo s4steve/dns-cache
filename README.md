@@ -4,6 +4,8 @@ A caching-only DNS server written in Rust. It forwards queries to upstream resol
 
 - **Views**: each client is assigned a view by its source IP/CIDR. Every view has its own upstreams, cache and blocklists.
 - **Blocklists**: a listed domain, *and every subdomain of it*, gets an immediate `NXDOMAIN`. Nothing is sent upstream.
+- **Allowlists**: exceptions to the blocklists, or a walled-garden view where *only* allowlisted names resolve.
+- **Local records**: your own A, AAAA, CNAME and TXT records (with automatic PTRs), answered without asking upstream.
 - **Upstreams**: plain UDP/TCP, DNS-over-TLS (DoT) or DNS-over-HTTPS (DoH).
 - **DNSSEC validation**: answers that fail validation get `SERVFAIL`.
 - **Hot reload**: on `SIGHUP` the server re-reads its config without dropping the cache.
@@ -64,6 +66,17 @@ Views are tried in the order they appear in the file, and the first one whose `m
 | `dnssec` | `true` | Validate DNSSEC. Bogus answers become `SERVFAIL`. |
 | `cache_size` | `8192` | Maximum number of cached responses for this view. |
 | `blocklists` | `[]` | Local file paths and/or `http(s)://` URLs. A name on any of them is blocked. |
+| `allowlists` | `[]` | Same format as blocklists. A name on any of them is never blocked. |
+| `allow_only` | `false` | Walled garden: only allowlisted names and local records resolve; everything else gets `NXDOMAIN`. |
+| `records` | `[]` | Local record files and/or URLs (see [Local records](#local-records)). |
+
+Each query is checked in this order, and the first step that decides it wins:
+
+1. **`records`**: a name defined there is answered from it.
+2. **`allowlists`**: a listed name (or subdomain) skips steps 3 and 4.
+3. **`allow_only`**: if true, any other name gets `NXDOMAIN`.
+4. **`blocklists`**: a listed name (or subdomain) gets `NXDOMAIN`.
+5. The cache, then the upstreams.
 
 ### Upstreams
 
@@ -108,6 +121,33 @@ ads.example.com
 - `http://` lists are accepted but logged as a warning, because anyone on the network path can add entries to them. Redirects from `https://` to `http://` are refused.
 - A source used by several views is downloaded and stored once, and shared between them.
 
+### Allowlists
+
+Allowlists use the blocklist format, matching rules and reloading. Two uses:
+
+- **Exceptions.** A big remote blocklist blocks something you need: put it on an allowlist instead of editing the list. `ad.doubleclick.net` on an allowlist unblocks that name and its subdomains, while the rest of `doubleclick.net` stays blocked.
+- **Walled garden.** With `allow_only = true`, a view resolves only allowlisted names (and local records). Only the name the client asks for is checked: if `wikipedia.org` is allowed and points at a CDN name through a CNAME, the CDN name is resolved too.
+
+### Local records
+
+Record files give fixed answers for your own names (split-horizon style). See [`lists/local.records`](lists/local.records):
+
+```text
+nas.home       A      192.168.1.10
+nas.home       AAAA   fd00::10
+files.home     CNAME  nas.home
+nas.home       TXT    "any text, up to 255 bytes"
+192.168.1.11   printer.home printer.lan      # hosts-style shorthand for A/AAAA
+```
+
+- Supported types are `A`, `AAAA`, `CNAME` and `TXT`. Names are case-insensitive and may be internationalised. `#` starts a comment, except inside TXT text.
+- **PTR** records are generated for every address, so `dig -x 192.168.1.10` returns `nas.home`. If an address has several names, the first one listed wins.
+- A name in a record file is answered **only** from it. A type you didn't define (e.g. `MX nas.home`) gets an empty `NOERROR`, not an upstream lookup. Names are matched exactly: `nas.home` does not cover `x.nas.home`.
+- A CNAME is followed through local records. If it leaves them (`cdn.home CNAME example.com`), the target is resolved upstream and appended. A CNAME can't share its name with other records, and CNAME loops get `SERVFAIL`.
+- Records answer with a 300-second TTL and are never DNSSEC-signed. The authoritative (AA) flag is never set.
+- When several record files define the same name, the first file in `records` wins.
+- Invalid lines are logged and skipped; the rest of the file still loads.
+
 ## Reloading
 
 ```bash
@@ -117,7 +157,7 @@ docker kill -s HUP dns-cache
 A reload re-reads `config.toml` and rebuilds the views:
 
 - **The cache is kept** for each view whose `name`, `upstreams`, `dnssec` and `cache_size` are unchanged. A view where any of those changed starts with an empty cache.
-- Blocklist files are re-read if they changed. Remote lists are only downloaded again if their copy is older than `refresh_secs`.
+- Blocklist, allowlist and record files are re-read if they changed. Remote lists are only downloaded again if their copy is older than `refresh_secs`.
 - If the new config is invalid, the error is logged and the old config keeps serving.
 - Changes to `listen`, `rate_limit` or `max_inflight` are logged as a warning and need a restart.
 
@@ -153,7 +193,7 @@ Binding to port 53 needs root (or `CAP_NET_BIND_SERVICE`). For local testing, us
 ## Tests
 
 ```bash
-cargo test                   # blocklist parsing and matching, rate limiter
+cargo test                   # list parsing and matching, local records, rate limiter
 ./tests/dnssec-check.sh      # needs docker + dig
 ```
 

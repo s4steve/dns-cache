@@ -9,7 +9,8 @@ use ipnet::IpNet;
 use serde::Deserialize;
 use tracing::info;
 
-use crate::blocklist::{self, Lists};
+use crate::lists::{self, Lists, Parsed, Set, Shared};
+use crate::records::Records;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -44,6 +45,15 @@ pub struct ViewConfig {
     pub cache_size: Option<u64>,
     #[serde(default)]
     pub blocklists: Vec<String>,
+    /// Names (and their subdomains) that are never blocked.
+    #[serde(default)]
+    pub allowlists: Vec<String>,
+    /// Walled garden: only allowlisted names (and local records) resolve.
+    #[serde(default)]
+    pub allow_only: bool,
+    /// Local record files, answered without asking upstream.
+    #[serde(default)]
+    pub records: Vec<String>,
 }
 
 #[derive(Deserialize, Clone, PartialEq)]
@@ -92,7 +102,10 @@ pub struct View {
     pub name: String,
     pub nets: Vec<IpNet>,
     pub resolver: TokioResolver,
-    pub blocklist: blocklist::Shared,
+    pub blocklist: Shared<Set>,
+    pub allowlist: Shared<Set>,
+    pub allow_only: bool,
+    pub records: Shared<Records>,
     key: ResolverKey,
 }
 
@@ -127,21 +140,41 @@ impl Config {
                 Some(o) => o.resolver.clone(), // clones share the same cache
                 None => resolver(v)?,
             };
-            let mut lists = Lists::new(&v.blocklists);
-            let sets = lists.refresh(refresh).await.unwrap_or_default();
-            info!(view = v.name, entries = blocklist::count(&sets), cache_kept = reused.is_some(), "view ready");
-            let blocklist = Arc::new(RwLock::new(sets));
-            lists.spawn(v.name.clone(), Arc::downgrade(&blocklist), poll, refresh);
+            let blocklist = load(&v.name, &v.blocklists, poll, refresh).await;
+            let allowlist = load(&v.name, &v.allowlists, poll, refresh).await;
+            let records = load(&v.name, &v.records, poll, refresh).await;
+            info!(
+                view = v.name,
+                blocked = lists::count(&blocklist.read().unwrap()),
+                allowed = lists::count(&allowlist.read().unwrap()),
+                allow_only = v.allow_only,
+                local_names = lists::count(&records.read().unwrap()),
+                cache_kept = reused.is_some(),
+                "view ready"
+            );
             views.push(View {
                 name: v.name.clone(),
                 nets: v.match_clients.clone(),
                 resolver,
                 blocklist,
+                allowlist,
+                allow_only: v.allow_only,
+                records,
                 key,
             });
         }
         Ok(views)
     }
+}
+
+/// Load list sources now, then keep polling them for changes while the view exists.
+async fn load<T: Parsed>(view: &str, locs: &[String], poll: Duration, refresh: Duration) -> Shared<T> {
+    let mut lists = Lists::<T>::new(locs);
+    let shared = Arc::new(RwLock::new(lists.refresh(refresh).await.unwrap_or_default()));
+    if !locs.is_empty() {
+        lists.spawn(view.to_string(), Arc::downgrade(&shared), poll, refresh);
+    }
+    shared
 }
 
 fn resolver(v: &ViewConfig) -> Result<TokioResolver, Error> {

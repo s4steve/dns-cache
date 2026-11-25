@@ -1,3 +1,7 @@
+//! Loading of list-like files and URLs (blocklists, allowlists, local records): polling,
+//! size caps, and one shared parsed copy per source. Plus the domain-set format itself.
+
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Read;
@@ -8,10 +12,31 @@ use std::time::{Duration, Instant, SystemTime};
 use hickory_server::proto::rr::Name;
 use tracing::{info, warn};
 
+/// Something a list source parses into.
+pub trait Parsed: Any + Send + Sync + Sized {
+    const KIND: &'static str; // for logs
+    fn parse(text: &str) -> Self;
+    fn len(&self) -> usize;
+}
+
+/// One parsed value per source, in config order. Sources are shared between views, never merged.
+pub type Loaded<T> = Arc<Vec<Arc<T>>>;
+pub type Shared<T> = Arc<RwLock<Loaded<T>>>;
+
+/// Domain names; a name also covers its subdomains. Used for blocklists and allowlists.
 pub type Set = HashSet<Box<str>>;
-/// One parsed set per source. Sources are shared between views, never merged into a copy.
-pub type Sets = Arc<Vec<Arc<Set>>>;
-pub type Shared = Arc<RwLock<Sets>>;
+
+impl Parsed for Set {
+    const KIND: &'static str = "domain list";
+    fn parse(text: &str) -> Self {
+        let mut set = Set::new();
+        parse(text, &mut set);
+        set
+    }
+    fn len(&self) -> usize {
+        HashSet::len(self)
+    }
+}
 
 /// Larger downloads or files are rejected (the last good copy is kept).
 const MAX_LIST_BYTES: u64 = 100 << 20;
@@ -45,7 +70,7 @@ pub fn parse(text: &str, out: &mut Set) {
 }
 
 /// True if `name` (as from `normalize`) or any parent domain is in any of the sets.
-pub fn is_blocked(sets: &[Arc<Set>], mut name: &str) -> bool {
+pub fn contains(sets: &[Arc<Set>], mut name: &str) -> bool {
     loop {
         if sets.iter().any(|s| s.contains(name)) {
             return true;
@@ -65,7 +90,8 @@ enum Stamp {
 
 /// Most recent load of each source, so views (and reloads) sharing a source share one copy
 /// and one download. Weak, so a source dropped from the config is freed.
-static LOADED: LazyLock<Mutex<HashMap<String, (Stamp, Weak<Set>)>>> = LazyLock::new(Default::default);
+type AnyWeak = Weak<dyn Any + Send + Sync>;
+static LOADED: LazyLock<Mutex<HashMap<(TypeId, String), (Stamp, AnyWeak)>>> = LazyLock::new(Default::default);
 
 static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -106,14 +132,14 @@ fn read_file(path: &str) -> Result<String, Error> {
     Ok(text)
 }
 
-struct Source {
+struct Source<T> {
     loc: String,
-    set: Option<Arc<Set>>,
+    set: Option<Arc<T>>,
     stamp: Option<Stamp>,
     retry_at: Option<Instant>, // after a failed download
 }
 
-impl Source {
+impl<T: Parsed> Source<T> {
     fn is_url(&self) -> bool {
         self.loc.starts_with("http://") || self.loc.starts_with("https://")
     }
@@ -133,7 +159,7 @@ impl Source {
                 Ok(m) => Some(Stamp::Modified(m)),
                 Err(e) => {
                     if self.stamp.is_none() {
-                        warn!(source = %self.loc, error = %e, "blocklist missing");
+                        warn!(kind = T::KIND, source = %self.loc, error = %e, "list missing");
                     }
                     return false;
                 }
@@ -141,13 +167,15 @@ impl Source {
         };
 
         // Reuse another view's (or the previous config's) copy if it is current.
-        let shared = LOADED.lock().unwrap().get(&self.loc).and_then(|(stamp, set)| {
+        let key = (TypeId::of::<T>(), self.loc.clone());
+        let shared = LOADED.lock().unwrap().get(&key).and_then(|(stamp, set)| {
             let fresh = match (current, *stamp) {
                 (None, Stamp::Fetched(t)) => t.elapsed() < refresh,
                 (Some(c), s) => c == s,
                 _ => false,
             };
-            fresh.then(|| set.upgrade()).flatten().map(|set| (*stamp, set))
+            let set = set.upgrade().filter(|_| fresh)?.downcast::<T>().ok()?;
+            Some((*stamp, set))
         });
         let (stamp, set) = match shared {
             Some(s) => s,
@@ -161,7 +189,7 @@ impl Source {
                     Err(e) => {
                         // The last good copy stays in use. Files are retried when they change,
                         // downloads after a back-off (so an oversized list isn't re-fetched every poll).
-                        warn!(source = %self.loc, error = %e, "blocklist load failed");
+                        warn!(kind = T::KIND, source = %self.loc, error = %e, "list load failed");
                         match current {
                             Some(m) => self.stamp = Some(m),
                             None => self.retry_at = Some(Instant::now() + refresh.min(Duration::from_secs(300))),
@@ -169,10 +197,9 @@ impl Source {
                         return false;
                     }
                 };
-                let mut set = Set::new();
-                parse(&text, &mut set);
-                let set = Arc::new(set);
-                LOADED.lock().unwrap().insert(self.loc.clone(), (stamp, Arc::downgrade(&set)));
+                let set = Arc::new(T::parse(&text));
+                let weak: AnyWeak = Arc::downgrade(&set) as Weak<T>;
+                LOADED.lock().unwrap().insert(key, (stamp, weak));
                 (stamp, set)
             }
         };
@@ -184,21 +211,21 @@ impl Source {
     }
 }
 
-pub struct Lists {
-    sources: Vec<Source>,
+pub struct Lists<T> {
+    sources: Vec<Source<T>>,
 }
 
-impl Lists {
+impl<T: Parsed> Lists<T> {
     pub fn new(locs: &[String]) -> Self {
         for l in locs.iter().filter(|l| l.starts_with("http://")) {
-            warn!(source = %l, "blocklist over plain http can be altered in transit; prefer https");
+            warn!(kind = T::KIND, source = %l, "list over plain http can be altered in transit; prefer https");
         }
         let sources = locs.iter().map(|l| Source { loc: l.clone(), set: None, stamp: None, retry_at: None }).collect();
         Self { sources }
     }
 
     /// Refresh every source; returns the current sets if anything changed.
-    pub async fn refresh(&mut self, refresh: Duration) -> Option<Sets> {
+    pub async fn refresh(&mut self, refresh: Duration) -> Option<Loaded<T>> {
         let mut changed = false;
         for s in &mut self.sources {
             changed |= s.refresh(refresh).await;
@@ -207,13 +234,13 @@ impl Lists {
     }
 
     /// Poll for changes until the view that owns `target` is dropped (e.g. on reload).
-    pub fn spawn(mut self, view: String, target: Weak<RwLock<Sets>>, poll: Duration, refresh: Duration) {
+    pub fn spawn(mut self, view: String, target: Weak<RwLock<Loaded<T>>>, poll: Duration, refresh: Duration) {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(poll).await;
                 let Some(target) = target.upgrade() else { return };
                 if let Some(sets) = self.refresh(refresh).await {
-                    info!(view, entries = count(&sets), "blocklist reloaded");
+                    info!(view, kind = T::KIND, entries = count(&sets), "list reloaded");
                     *target.write().unwrap() = sets;
                 }
             }
@@ -221,7 +248,7 @@ impl Lists {
     }
 }
 
-pub fn count(sets: &[Arc<Set>]) -> usize {
+pub fn count<T: Parsed>(sets: &[Arc<T>]) -> usize {
     sets.iter().map(|s| s.len()).sum()
 }
 
@@ -238,32 +265,32 @@ mod tests {
     #[test]
     fn matching() {
         let s = sets("Example.com.\n# comment\n\nads.tracker.net # trailing\n");
-        assert!(is_blocked(&s, "example.com"));
-        assert!(is_blocked(&s, "a.b.example.com"));
-        assert!(is_blocked(&s, "x.ads.tracker.net"));
-        assert!(!is_blocked(&s, "tracker.net"));
-        assert!(!is_blocked(&s, "com"));
-        assert!(!is_blocked(&s, "notexample.com"));
-        assert!(!is_blocked(&s, ""));
+        assert!(contains(&s, "example.com"));
+        assert!(contains(&s, "a.b.example.com"));
+        assert!(contains(&s, "x.ads.tracker.net"));
+        assert!(!contains(&s, "tracker.net"));
+        assert!(!contains(&s, "com"));
+        assert!(!contains(&s, "notexample.com"));
+        assert!(!contains(&s, ""));
     }
 
     #[test]
     fn hosts_format() {
         let s = sets("127.0.0.1 localhost\n0.0.0.0 0.0.0.0\n::1 ip6-localhost\n0.0.0.0 bad.example a.bad.org\n");
         assert_eq!(count(&s), 2, "{s:?}");
-        assert!(is_blocked(&s, "bad.example"));
-        assert!(is_blocked(&s, "a.bad.org"));
+        assert!(contains(&s, "bad.example"));
+        assert!(contains(&s, "a.bad.org"));
     }
 
     #[test]
     fn idn_entries_match_punycode_queries() {
         // Lists store IDNs either way; queries arrive as punycode.
         let s = sets("xn--bcher-kva.example\nBücher2.example\n");
-        assert!(is_blocked(&s, "xn--bcher-kva.example"));
-        assert!(is_blocked(&s, "www.xn--bcher2-3ya.example"));
+        assert!(contains(&s, "xn--bcher-kva.example"));
+        assert!(contains(&s, "www.xn--bcher2-3ya.example"));
         assert_eq!(normalize("Bücher.Example.").as_deref(), Some("xn--bcher-kva.example"));
         // What the server matches is Name::to_ascii of the query.
         let q = Name::from_utf8("www.bücher.example.").unwrap().to_ascii();
-        assert!(is_blocked(&sets("bücher.example"), q.trim_end_matches('.')));
+        assert!(contains(&sets("bücher.example"), q.trim_end_matches('.')));
     }
 }

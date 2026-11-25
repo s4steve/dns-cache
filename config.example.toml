@@ -11,7 +11,13 @@ max_inflight = 1024       # upstream lookups in progress at once; excess gets SE
 
 # Views are matched by client source address; first match wins.
 # Each view has its own cache, upstreams and blocklists.
-# A blocked name, or any subdomain of it, gets NXDOMAIN without being resolved.
+# Each query is checked in this order:
+#   1. records     your own names (files of A/AAAA/CNAME/TXT); PTRs are generated
+#   2. allowlists  names (and subdomains) that are never blocked
+#   3. allow_only  if true, anything not allowlisted gets NXDOMAIN (walled garden)
+#   4. blocklists  a listed name, or any subdomain of it, gets NXDOMAIN
+#   5. cache, then upstream
+# All three list kinds take local files and/or http(s) URLs, and are reloaded on change.
 # A client that matches no view gets REFUSED, so keep match_clients to networks you
 # serve: a view matching 0.0.0.0/0 on a public address is an open resolver that
 # attackers will use for DDoS amplification.
@@ -30,6 +36,7 @@ blocklists = [
   # Remote lists may be plain domains or hosts format, e.g.:
   # "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
 ]
+# allow_only = true   # walled garden: only allowlists + records resolve
 
 [[view]]
 name = "default"
@@ -44,3 +51,5 @@ upstreams = [
   { ip = "1.1.1.1" },   # plain udp/tcp; port defaults to 53/853/443 by protocol
 ]
 blocklists = ["/etc/dns-cache/lists/default.txt"]
+allowlists = ["/etc/dns-cache/lists/allow.txt"]
+records = ["/etc/dns-cache/lists/local.records"]
